@@ -1,17 +1,22 @@
 import asyncio
-import html
+import importlib
+import json
 import os
 from dataclasses import dataclass
-from typing import Any, Union, cast, List, Set, Tuple, Optional, Dict
+from typing import Any, Dict, List, Optional, Set, Tuple, Union, cast
+
 import numpy as np
-from nano_vectordb import NanoVectorDB
+import requests
 from hyperdb import HypergraphDB
-from .utils import load_json, logger, write_json
+from nano_vectordb import NanoVectorDB
+
 from .base import (
+    BaseHypergraphStorage,
     BaseKVStorage,
     BaseVectorStorage,
-    BaseHypergraphStorage
 )
+from .prompt import GRAPH_FIELD_SEP
+from .utils import load_json, logger, write_json
 
 
 @dataclass
@@ -205,3 +210,319 @@ class HypergraphStorage(BaseHypergraphStorage):
             Return the neighbors of the vertex.
         """
         return self._hg.nbr_v(v_id)
+
+
+@dataclass
+class BaseTuGraphStorage(BaseHypergraphStorage):
+    """Shared TuGraph storage adapter logic for Cypher-based backends."""
+
+    def __post_init__(self):
+        self.server_url = self.global_config.get("tugraph_server_url", "http://localhost:7071")
+        self.graph_name = self.global_config.get("tugraph_graph_name", "default")
+        self.username = self.global_config.get("tugraph_user", "admin")
+        self.password = self.global_config.get("tugraph_password", "73@TuGraph")
+        self.auto_create_schema = self.global_config.get("tugraph_auto_create_schema", True)
+
+        self._setup_client()
+
+        if self.auto_create_schema:
+            try:
+                self._ensure_schema()
+            except Exception as exc:  # pragma: no cover - best effort for remote service
+                logger.warning(f"Failed to ensure TuGraph schema: {exc}")
+
+    # ------------------------------------------------------------------
+    # hooks implemented by concrete backends
+    # ------------------------------------------------------------------
+    def _setup_client(self):
+        raise NotImplementedError
+
+    def _run_cypher_sync(self, script: str, parameters: Optional[dict] = None):
+        raise NotImplementedError
+
+    async def _run_cypher(self, script: str, parameters: Optional[dict] = None):
+        return await asyncio.to_thread(self._run_cypher_sync, script, parameters)
+
+    def _ensure_schema(self):
+        # Constraints are idempotent in Cypher when using IF NOT EXISTS
+        schema_statements = [
+            "CREATE CONSTRAINT entity_name_unique IF NOT EXISTS FOR (e:Entity) REQUIRE e.entity_name IS UNIQUE",
+            "CREATE CONSTRAINT hyperedge_id_unique IF NOT EXISTS FOR (h:HyperEdge) REQUIRE h.id_set IS UNIQUE",
+        ]
+        for statement in schema_statements:
+            try:
+                self._run_cypher_sync(statement)
+            except Exception as exc:  # pragma: no cover - best effort for remote service
+                logger.debug(f"Schema statement failed (ignored): {exc}")
+
+    @staticmethod
+    def _normalize_hyperedge_key(e_tuple: Union[List, Set, Tuple]) -> Tuple[str, ...]:
+        return tuple(sorted([str(x) for x in e_tuple]))
+
+    @staticmethod
+    def _hyperedge_id_set(e_tuple: Union[List, Set, Tuple]) -> str:
+        return GRAPH_FIELD_SEP.join(BaseTuGraphStorage._normalize_hyperedge_key(e_tuple))
+
+    # ------------------------------------------------------------------
+    # Vertex helpers
+    # ------------------------------------------------------------------
+    async def has_vertex(self, v_id: Any) -> bool:
+        script = "MATCH (e:Entity {entity_name: $id}) RETURN count(e) > 0"
+        result = await self._run_cypher(script, {"id": v_id})
+        data = result.get("data") or result.get("results", [{}])[0].get("data", [])
+        return bool(data and (data[0][0] if isinstance(data[0], list) else data[0]))
+
+    async def get_vertex(self, v_id: str, default: Any = None):
+        script = "MATCH (e:Entity {entity_name: $id}) RETURN e"
+        result = await self._run_cypher(script, {"id": v_id})
+        data = result.get("data") or result.get("results", [{}])[0].get("data", [])
+        if not data:
+            return default
+        node = data[0][0] if isinstance(data[0], list) else data[0]
+        return node.get("properties", node)
+
+    async def upsert_vertex(self, v_id: Any, v_data: Optional[Dict] = None):
+        v_data = v_data or {}
+        script = (
+            "MERGE (e:Entity {entity_name: $id}) "
+            "SET e += $payload RETURN e"
+        )
+        payload = {k: v for k, v in v_data.items()}
+        await self._run_cypher(script, {"id": v_id, "payload": payload})
+        return v_data
+
+    async def remove_vertex(self, v_id: Any):
+        script = "MATCH (e:Entity {entity_name: $id}) DETACH DELETE e"
+        await self._run_cypher(script, {"id": v_id})
+
+    async def get_all_vertices(self):
+        script = "MATCH (e:Entity) RETURN e"
+        result = await self._run_cypher(script)
+        rows = result.get("data") or result.get("results", [{}])[0].get("data", [])
+        return [
+            (row[0] if isinstance(row, list) else row).get("properties", row[0] if isinstance(row, list) else row)
+            for row in rows
+        ]
+
+    async def get_num_of_vertices(self):
+        script = "MATCH (e:Entity) RETURN count(e)"
+        result = await self._run_cypher(script)
+        data = result.get("data") or result.get("results", [{}])[0].get("data", [])
+        return int(data[0][0] if isinstance(data[0], list) else data[0]) if data else 0
+
+    async def vertex_degree(self, v_id: Any) -> int:
+        script = (
+            "MATCH (e:Entity {entity_name: $id})<-[:CONNECTS]-(h:HyperEdge) "
+            "RETURN count(h)"
+        )
+        result = await self._run_cypher(script, {"id": v_id})
+        data = result.get("data") or result.get("results", [{}])[0].get("data", [])
+        return int(data[0][0] if isinstance(data[0], list) else data[0]) if data else 0
+
+    # ------------------------------------------------------------------
+    # Hyperedge helpers
+    # ------------------------------------------------------------------
+    async def has_hyperedge(self, e_tuple: Union[List, Set, Tuple]) -> bool:
+        id_set = self._hyperedge_id_set(e_tuple)
+        script = "MATCH (h:HyperEdge {id_set: $id_set}) RETURN count(h) > 0"
+        result = await self._run_cypher(script, {"id_set": id_set})
+        data = result.get("data") or result.get("results", [{}])[0].get("data", [])
+        return bool(data and (data[0][0] if isinstance(data[0], list) else data[0]))
+
+    async def get_hyperedge(self, e_tuple: Union[List, Set, Tuple], default: Any = None):
+        id_set = self._hyperedge_id_set(e_tuple)
+        script = "MATCH (h:HyperEdge {id_set: $id_set}) RETURN h"
+        result = await self._run_cypher(script, {"id_set": id_set})
+        data = result.get("data") or result.get("results", [{}])[0].get("data", [])
+        if not data:
+            return default
+        hyperedge = data[0][0] if isinstance(data[0], list) else data[0]
+        return hyperedge.get("properties", hyperedge)
+
+    async def upsert_hyperedge(self, e_tuple: Union[List, Set, Tuple], e_data: Optional[Dict] = None):
+        e_data = e_data or {}
+        normalized = self._normalize_hyperedge_key(e_tuple)
+        id_set = self._hyperedge_id_set(normalized)
+        payload = {**e_data, "id_set": id_set}
+
+        # ensure entity nodes exist and link them to the hyperedge node
+        entities_payload = [{"entity_name": ent} for ent in normalized]
+        await asyncio.gather(*[
+            self.upsert_vertex(ent["entity_name"], {}) for ent in entities_payload
+        ])
+
+        script = (
+            "MERGE (h:HyperEdge {id_set: $id_set}) "
+            "SET h += $payload "
+            "WITH h UNWIND $entities AS ent "
+            "MERGE (e:Entity {entity_name: ent.entity_name}) "
+            "MERGE (h)-[r:CONNECTS]->(e) "
+            "SET r.weight = $weight, r.source_id = $source_id, r.description = $description, r.keywords = $keywords "
+            "RETURN h"
+        )
+
+        await self._run_cypher(
+            script,
+            {
+                "id_set": id_set,
+                "payload": payload,
+                "entities": entities_payload,
+                "weight": e_data.get("weight", 0),
+                "source_id": e_data.get("source_id", ""),
+                "description": e_data.get("description", ""),
+                "keywords": e_data.get("keywords", ""),
+            },
+        )
+        return payload
+
+    async def remove_hyperedge(self, e_tuple: Union[List, Set, Tuple]):
+        id_set = self._hyperedge_id_set(e_tuple)
+        script = "MATCH (h:HyperEdge {id_set: $id_set}) DETACH DELETE h"
+        await self._run_cypher(script, {"id_set": id_set})
+
+    async def get_all_hyperedges(self):
+        script = "MATCH (h:HyperEdge) RETURN h"
+        result = await self._run_cypher(script)
+        rows = result.get("data") or result.get("results", [{}])[0].get("data", [])
+        return [
+            (row[0] if isinstance(row, list) else row).get("properties", row[0] if isinstance(row, list) else row)
+            for row in rows
+        ]
+
+    async def get_num_of_hyperedges(self):
+        script = "MATCH (h:HyperEdge) RETURN count(h)"
+        result = await self._run_cypher(script)
+        data = result.get("data") or result.get("results", [{}])[0].get("data", [])
+        return int(data[0][0] if isinstance(data[0], list) else data[0]) if data else 0
+
+    async def hyperedge_degree(self, e_tuple: Union[List, Set, Tuple]) -> int:
+        id_set = self._hyperedge_id_set(e_tuple)
+        script = (
+            "MATCH (h:HyperEdge {id_set: $id_set})-[r:CONNECTS]->(e:Entity) "
+            "RETURN count(r)"
+        )
+        result = await self._run_cypher(script, {"id_set": id_set})
+        data = result.get("data") or result.get("results", [{}])[0].get("data", [])
+        return int(data[0][0] if isinstance(data[0], list) else data[0]) if data else 0
+
+    async def get_nbr_e_of_vertex(self, e_tuple: Union[List, Set, Tuple]) -> list:
+        script = (
+            "MATCH (e:Entity {entity_name: $id})<-[:CONNECTS]-(h:HyperEdge) "
+            "RETURN h.id_set"
+        )
+        result = await self._run_cypher(script, {"id": e_tuple})
+        rows = result.get("data") or result.get("results", [{}])[0].get("data", [])
+        return [row[0] if isinstance(row, list) else row for row in rows]
+
+    async def get_nbr_v_of_hyperedge(self, v_id: Any, exclude_self=True) -> list:
+        id_set = self._hyperedge_id_set(v_id if isinstance(v_id, (list, set, tuple)) else [v_id])
+        script = (
+            "MATCH (h:HyperEdge {id_set: $id_set})-[:CONNECTS]->(e:Entity) "
+            "RETURN e.entity_name"
+        )
+        result = await self._run_cypher(script, {"id_set": id_set})
+        rows = result.get("data") or result.get("results", [{}])[0].get("data", [])
+        return [row[0] if isinstance(row, list) else row for row in rows]
+
+    async def get_nbr_v_of_vertex(self, v_id: Any, exclude_self=True) -> list:
+        script = (
+            "MATCH (e:Entity {entity_name: $id})<-[:CONNECTS]-(h:HyperEdge)-[:CONNECTS]->(n:Entity) "
+            "WHERE $exclude_self = false OR n.entity_name <> $id "
+            "RETURN DISTINCT n.entity_name"
+        )
+        result = await self._run_cypher(script, {"id": v_id, "exclude_self": exclude_self})
+        rows = result.get("data") or result.get("results", [{}])[0].get("data", [])
+        return [row[0] if isinstance(row, list) else row for row in rows]
+
+    # ------------------------------------------------------------------
+    # Callbacks
+    # ------------------------------------------------------------------
+    async def index_done_callback(self):
+        # TuGraph persists data immediately; nothing to do.
+        return None
+
+    async def query_done_callback(self):
+        return None
+
+
+@dataclass
+class TuGraphStorage(BaseTuGraphStorage):
+    """TuGraph REST adapter using ``requests``."""
+
+    def _setup_client(self):
+        self._session = requests.Session()
+        self._session.auth = (self.username, self.password)
+        self._cypher_endpoint = f"{self.server_url.rstrip('/')}/cypher"
+
+    def _run_cypher_sync(self, script: str, parameters: Optional[dict] = None):
+        payload = {
+            "graph": self.graph_name,
+            "script": script,
+            "parameters": parameters or {},
+        }
+        response = self._session.post(
+            self._cypher_endpoint,
+            data=json.dumps(payload),
+            headers={"Content-Type": "application/json"},
+        )
+        response.raise_for_status()
+        return response.json()
+
+
+@dataclass
+class TuGraphClientStorage(BaseTuGraphStorage):
+    """TuGraph adapter using the official Python SDK (TuGraphClient)."""
+
+    def _setup_client(self):
+        try:
+            sdk_module = importlib.import_module("tugraph.client")
+        except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
+            raise ImportError(
+                "tugraph-client SDK is required for TuGraphClientStorage. Install with `pip install tugraph`"
+            ) from exc
+
+        client_cls = getattr(sdk_module, "TuGraphClient", None)
+        if client_cls is None:  # pragma: no cover - depends on SDK version
+            raise ImportError("TuGraphClient class not found in tugraph.client module")
+
+        # Follow the official SDK usage: TuGraphClient(host, port, user, password, graph_name)
+        # https://tugraph-db.readthedocs.io/en/latest/7.client-tools/1.python-client.html
+        parsed = self.server_url.replace("http://", "").replace("https://", "")
+        host, _, port = parsed.partition(":")
+        port_num = int(port) if port else 7071
+        self._client = client_cls(host, port_num, self.username, self.password, self.graph_name)
+
+        if hasattr(self._client, "login"):
+            self._client.login(self.username, self.password)
+
+    def _run_cypher_sync(self, script: str, parameters: Optional[dict] = None):
+        params = parameters or {}
+        # Support both dict and positional APIs in different SDK versions
+        if hasattr(self._client, "call_cypher"):
+            response = self._client.call_cypher(script, params)
+        elif hasattr(self._client, "cypher"):
+            response = self._client.cypher(script, params)
+        else:  # pragma: no cover - unsupported SDK
+            raise RuntimeError("TuGraph client does not expose cypher execution method")
+
+        if response is None:
+            return {"data": []}
+
+        if isinstance(response, str):
+            try:
+                return json.loads(response)
+            except json.JSONDecodeError:  # pragma: no cover - SDK specific
+                return {"data": []}
+
+        if isinstance(response, dict):
+            return response
+
+        # Some SDKs return tuple (success, result_json)
+        if isinstance(response, tuple) and len(response) >= 2:
+            try:
+                return json.loads(response[1]) if isinstance(response[1], str) else response[1]
+            except json.JSONDecodeError:  # pragma: no cover
+                return {"data": []}
+
+        return {"data": []}
+
