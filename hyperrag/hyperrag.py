@@ -24,7 +24,6 @@ from .storage import (
     NanoVectorDBStorage,
     HypergraphStorage,
     TuGraphStorage,
-    TuGraphClientStorage,
 )
 
 
@@ -139,8 +138,6 @@ class HyperRAG:
         backend = self.hypergraph_backend.lower()
         if backend == "tugraph":
             hypergraph_cls = TuGraphStorage
-        elif backend == "tugraph_client":
-            hypergraph_cls = TuGraphClientStorage
 
         self.chunk_entity_relation_hypergraph = hypergraph_cls(
             namespace="chunk_entity_relation", global_config=asdict(self)

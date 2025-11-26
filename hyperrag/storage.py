@@ -1,12 +1,11 @@
 import asyncio
-import importlib
 import json
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple, Union, cast
 
+import httpx
 import numpy as np
-import requests
 from hyperdb import HypergraphDB
 from nano_vectordb import NanoVectorDB
 
@@ -447,11 +446,10 @@ class BaseTuGraphStorage(BaseHypergraphStorage):
 
 @dataclass
 class TuGraphStorage(BaseTuGraphStorage):
-    """TuGraph REST adapter using ``requests``."""
+    """TuGraph REST adapter using ``httpx``."""
 
     def _setup_client(self):
-        self._session = requests.Session()
-        self._session.auth = (self.username, self.password)
+        self._session = httpx.Client(auth=(self.username, self.password))
         self._cypher_endpoint = f"{self.server_url.rstrip('/')}/cypher"
 
     def _run_cypher_sync(self, script: str, parameters: Optional[dict] = None):
@@ -460,69 +458,7 @@ class TuGraphStorage(BaseTuGraphStorage):
             "script": script,
             "parameters": parameters or {},
         }
-        response = self._session.post(
-            self._cypher_endpoint,
-            data=json.dumps(payload),
-            headers={"Content-Type": "application/json"},
-        )
+        response = self._session.post(self._cypher_endpoint, json=payload)
         response.raise_for_status()
         return response.json()
-
-
-@dataclass
-class TuGraphClientStorage(BaseTuGraphStorage):
-    """TuGraph adapter using the official Python SDK (TuGraphClient)."""
-
-    def _setup_client(self):
-        try:
-            sdk_module = importlib.import_module("tugraph.client")
-        except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
-            raise ImportError(
-                "tugraph-client SDK is required for TuGraphClientStorage. Install with `pip install tugraph`"
-            ) from exc
-
-        client_cls = getattr(sdk_module, "TuGraphClient", None)
-        if client_cls is None:  # pragma: no cover - depends on SDK version
-            raise ImportError("TuGraphClient class not found in tugraph.client module")
-
-        # Follow the official SDK usage: TuGraphClient(host, port, user, password, graph_name)
-        # https://tugraph-db.readthedocs.io/en/latest/7.client-tools/1.python-client.html
-        parsed = self.server_url.replace("http://", "").replace("https://", "")
-        host, _, port = parsed.partition(":")
-        port_num = int(port) if port else 7071
-        self._client = client_cls(host, port_num, self.username, self.password, self.graph_name)
-
-        if hasattr(self._client, "login"):
-            self._client.login(self.username, self.password)
-
-    def _run_cypher_sync(self, script: str, parameters: Optional[dict] = None):
-        params = parameters or {}
-        # Support both dict and positional APIs in different SDK versions
-        if hasattr(self._client, "call_cypher"):
-            response = self._client.call_cypher(script, params)
-        elif hasattr(self._client, "cypher"):
-            response = self._client.cypher(script, params)
-        else:  # pragma: no cover - unsupported SDK
-            raise RuntimeError("TuGraph client does not expose cypher execution method")
-
-        if response is None:
-            return {"data": []}
-
-        if isinstance(response, str):
-            try:
-                return json.loads(response)
-            except json.JSONDecodeError:  # pragma: no cover - SDK specific
-                return {"data": []}
-
-        if isinstance(response, dict):
-            return response
-
-        # Some SDKs return tuple (success, result_json)
-        if isinstance(response, tuple) and len(response) >= 2:
-            try:
-                return json.loads(response[1]) if isinstance(response[1], str) else response[1]
-            except json.JSONDecodeError:  # pragma: no cover
-                return {"data": []}
-
-        return {"data": []}
 

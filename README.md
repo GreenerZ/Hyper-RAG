@@ -157,25 +157,23 @@ We provide a web-based visualization tool for hypergraphs and lightweight Hyper-
 ![vis-hg](./assets/vis-hg.png)
 
 ### Using TuGraph as the storage backend
-Hyper-RAG can persist its hypergraph either to the built-in Hypergraph-DB (default) or to TuGraph. Two TuGraph adapters are available:
+Hyper-RAG can persist its hypergraph either to the built-in Hypergraph-DB (default) or to TuGraph using the HTTP adapter:
 
-- `hypergraph_backend="tugraph"`: uses TuGraph's HTTP Cypher endpoint via `requests` (no extra dependency).
-- `hypergraph_backend="tugraph_client"`: uses the official TuGraph Python SDK (`pip install tugraph`).
+- `hypergraph_backend="tugraph"`: uses TuGraph's HTTP Cypher endpoint via `httpx` (no extra dependency).
 
-Both adapters auto-create the required schema (unique `Entity.entity_name` and `HyperEdge.id_set` constraints) when `tugraph_auto_create_schema=True`.
+The adapter auto-creates the required schema (unique `Entity.entity_name` and `HyperEdge.id_set` constraints) when `tugraph_auto_create_schema=True`.
 
 **Quick test with TuGraph:**
 
 1. Start a TuGraph service (default admin password `73@TuGraph`) and ensure the target graph (e.g., `default`) exists.
-2. (SDK option only) `pip install tugraph` to install the TuGraph client library.
-3. Run a minimal ingestion/query script:
+2. Run a minimal ingestion/query script:
 
 ```bash
 python - <<'PY'
 from hyperrag.hyperrag import HyperRAG
 
 rag = HyperRAG(
-    hypergraph_backend="tugraph_client",  # use "tugraph" to exercise the HTTP adapter
+    hypergraph_backend="tugraph",  # TuGraph HTTP adapter
     tugraph_server_url="http://127.0.0.1:7071",
     tugraph_graph_name="default",
     tugraph_user="admin",
