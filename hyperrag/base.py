@@ -127,10 +127,10 @@ class BaseHypergraphStorage(StorageNameSpace):
     async def hyperedge_degree(self, e_tuple: Union[List, Set, Tuple]) -> int:
         raise NotImplementedError
 
-    async def get_nbr_e_of_vertex(self, e_tuple: Union[List, Set, Tuple]) -> list:
+    async def get_nbr_e_of_vertex(self, v_id: Any) -> list:
         raise NotImplementedError
 
-    async def get_nbr_v_of_hyperedge(self, v_id: Any, exclude_self=True) -> list:
+    async def get_nbr_v_of_hyperedge(self, e_tuple: Union[List, Set, Tuple]) -> list:
         raise NotImplementedError
 
     async def get_nbr_v_of_vertex(self, v_id: Any, exclude_self=True) -> list:

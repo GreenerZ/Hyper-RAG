@@ -760,7 +760,8 @@ async def _find_most_related_text_unit_from_entities(
     for this_edges in edges:
         if not this_edges:
             continue
-        all_one_hop_nodes.update([e for e in this_edges])
+        for edge_tuple in this_edges:
+            all_one_hop_nodes.update(edge_tuple)
 
     all_one_hop_nodes = list(all_one_hop_nodes)
     all_one_hop_nodes_data = await asyncio.gather(
@@ -781,12 +782,13 @@ async def _find_most_related_text_unit_from_entities(
                 continue
             relation_counts = 0
             if this_edges:  # Add check for None edges
-                for e in this_edges:
-                    if (
-                        e in all_one_hop_text_units_lookup
-                        and c_id in all_one_hop_text_units_lookup[e]
-                    ):
-                        relation_counts += 1
+                for edge_tuple in this_edges:
+                    for e in edge_tuple:                    
+                        if (
+                            e in all_one_hop_text_units_lookup
+                            and c_id in all_one_hop_text_units_lookup[e]
+                        ):
+                            relation_counts += 1
             
             chunk_data = await text_chunks_db.get_by_id(c_id)
             if chunk_data is not None and "content" in chunk_data:  # Add content check
