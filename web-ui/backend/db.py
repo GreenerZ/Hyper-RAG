@@ -1,29 +1,41 @@
-from hyperdb import HypergraphDB
 import os
+from hyperrag.hypergraph_backend import get_hypergraph_driver
 
 class DatabaseManager:
     """数据库管理器，支持多个数据库实例"""
     def __init__(self):
         self.databases = {}
+        self.database_paths = {}
         self.cache_dir = "hyperrag_cache"
+        self.driver = get_hypergraph_driver(os.environ.get("HYPERRAG_HYPERGRAPH_BACKEND"))
         
     def get_database(self, database_name=None):
         """获取数据库实例"""
         if database_name is None:
             return None
             
-        # 构建完整的数据库文件路径
+        # 构建数据库标识（本地文件路径或远程数据库名）
         database_path = os.path.join(self.cache_dir, database_name, "hypergraph_chunk_entity_relation.hgdb")
-        
-        # 检查数据库文件是否存在
-        if not os.path.exists(database_path):
+        database_identifier = database_path if self.driver.requires_local_file else database_name
+
+        # 检查数据库文件是否存在（仅本地文件型后端需要）
+        if self.driver.requires_local_file and not os.path.exists(database_path):
             raise Exception(f"Database file '{database_path}' does not exist")
-            
+
         # 如果数据库实例不存在，创建新实例
         if database_name not in self.databases:
-            self.databases[database_name] = HypergraphDB(storage_file=database_path)
-            
+            self.databases[database_name] = self.driver.load_or_create(database_identifier)
+            self.database_paths[database_name] = database_path
+
         return self.databases[database_name]
+
+    def persist_database(self, database_name: str):
+        """Persist and clear caches for the specified database."""
+
+        db = self.databases[database_name]
+        db_path = self.database_paths[database_name]
+        self.driver.save(db, db_path)
+        self.driver.clear_cache(db)
     
     def list_databases(self):
         """列出hyperrag_cache目录下所有可用的数据库文件"""
@@ -286,12 +298,9 @@ def add_vertex(vertex_id: str, vertex_data: dict, database=None):
         
         # 添加vertex
         db.add_v(vertex_id, vertex_data)
-        
+
         # 保存到文件
-        db.save(db.storage_file)
-        
-        # 清除缓存
-        db._clear_cache()
+        db_manager.persist_database(database)
         
         return db.v(vertex_id)
     except Exception as e:
@@ -317,12 +326,9 @@ def add_hyperedge(vertices: list, hyperedge_data: dict, database=None):
         
         # 添加hyperedge
         db.add_e(edge_tuple, hyperedge_data)
-        
+
         # 保存到文件
-        db.save(db.storage_file)
-        
-        # 清除缓存
-        db._clear_cache()
+        db_manager.persist_database(database)
         
         return db.e(edge_tuple)
     except Exception as e:
@@ -349,12 +355,9 @@ def update_vertex(vertex_id: str, vertex_data: dict, database=None):
         # 移除旧的vertex并添加新的
         db.remove_v(vertex_id)
         db.add_v(vertex_id, existing_data)
-        
+
         # 保存到文件
-        db.save(db.storage_file)
-        
-        # 清除缓存
-        db._clear_cache()
+        db_manager.persist_database(database)
         
         return db.v(vertex_id)
     except Exception as e:
@@ -384,12 +387,9 @@ def update_hyperedge(vertices: list, hyperedge_data: dict, database=None):
         # 移除旧的hyperedge并添加新的
         db.remove_e(edge_tuple)
         db.add_e(edge_tuple, existing_data)
-        
+
         # 保存到文件
-        db.save(db.storage_file)
-        
-        # 清除缓存
-        db._clear_cache()
+        db_manager.persist_database(database)
         
         return db.e(edge_tuple)
     except Exception as e:
@@ -407,12 +407,9 @@ def delete_vertex(vertex_id: str, database=None):
         
         # 删除vertex
         db.remove_v(vertex_id)
-        
+
         # 保存到文件
-        db.save(db.storage_file)
-        
-        # 清除缓存
-        db._clear_cache()
+        db_manager.persist_database(database)
         
         return True
     except Exception as e:
@@ -433,12 +430,9 @@ def delete_hyperedge(vertices: list, database=None):
         
         # 删除hyperedge
         db.remove_e(edge_tuple)
-        
+
         # 保存到文件
-        db.save(db.storage_file)
-        
-        # 清除缓存
-        db._clear_cache()
+        db_manager.persist_database(database)
         
         return True
     except Exception as e:
