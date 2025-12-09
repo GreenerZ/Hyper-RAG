@@ -23,6 +23,7 @@ from .storage import (
     JsonKVStorage,
     NanoVectorDBStorage,
     HypergraphStorage,
+    TuGraphStorage,
 )
 
 
@@ -94,6 +95,7 @@ class HyperRAG:
     vector_db_storage_cls: Type[BaseVectorStorage] = NanoVectorDBStorage
     vector_db_storage_cls_kwargs: dict = field(default_factory=dict)
     hypergraph_storage_cls: Type[BaseHypergraphStorage] = HypergraphStorage
+    hypergraph_backend: str = "hypergraphdb"
     enable_llm_cache: bool = True
 
     # extension
@@ -132,7 +134,12 @@ class HyperRAG:
         """
             download from hgdb_path
         """
-        self.chunk_entity_relation_hypergraph = self.hypergraph_storage_cls(
+        hypergraph_cls = self.hypergraph_storage_cls
+        backend = self.hypergraph_backend.lower()
+        if backend == "tugraph":
+            hypergraph_cls = TuGraphStorage
+
+        self.chunk_entity_relation_hypergraph = hypergraph_cls(
             namespace="chunk_entity_relation", global_config=asdict(self)
         )
 

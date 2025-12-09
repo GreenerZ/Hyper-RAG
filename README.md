@@ -156,8 +156,36 @@ We provide a web-based visualization tool for hypergraphs and lightweight Hyper-
 ![vis-qa](./assets/vis-QA.png)
 ![vis-hg](./assets/vis-hg.png)
 
-### Storage architecture note
-Both the core library and the web UI access hypergraph storage. See [docs/storage-architecture.md](docs/storage-architecture.md) for how the current HypergraphDB integration is layered and how to swap in alternative backends such as TuGraph.
+### Using TuGraph as the storage backend
+Hyper-RAG can persist its hypergraph either to the built-in Hypergraph-DB (default) or to TuGraph using the HTTP adapter:
+
+- `hypergraph_backend="tugraph"`: uses TuGraph's HTTP Cypher endpoint via `httpx` (no extra dependency).
+
+The adapter auto-creates the required schema (unique `Entity.entity_name` and `HyperEdge.id_set` constraints) when `tugraph_auto_create_schema=True`.
+
+**Quick test with TuGraph:**
+
+1. Start a TuGraph service (default admin password `73@TuGraph`) and ensure the target graph (e.g., `default`) exists.
+2. Run a minimal ingestion/query script:
+
+```bash
+python - <<'PY'
+from hyperrag.hyperrag import HyperRAG
+
+rag = HyperRAG(
+    hypergraph_backend="tugraph",  # TuGraph HTTP adapter
+    tugraph_server_url="http://127.0.0.1:7071",
+    tugraph_graph_name="default",
+    tugraph_user="admin",
+    tugraph_password="73@TuGraph",
+)
+
+rag.insert(["Paris is the capital of France.", "Berlin is the capital of Germany."])
+print(rag.query("What are the capitals in Europe?"))
+PY
+```
+
+Successful execution confirms that Hyper-RAG can read/write through the chosen TuGraph storage layer.
 
 ## :whale: Docker Deployment
 
